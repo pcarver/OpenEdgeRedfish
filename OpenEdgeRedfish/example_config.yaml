@@ -1,0 +1,23 @@
+---
+targets:
+  #- Enter name or IP here
+  #- Enter name or IP here
+  #- Enter name or IP here
+  #- Enter name or IP here
+  #- Enter name or IP here
+credentials:
+  user: Administrator
+  #password: Leave blank to be prompted at runtime
+images:
+  BIOS1:
+    wantedVersion: 3B06
+    imageurl: http://something
+  BMC1:
+    wantedVersion: 3.13.00
+    imageurl: http://something
+  BMC2:
+    wantedVersion: 3.13.00
+    imageurl: http://something
+  CPLD:
+    wantedVersion: "0x01" # Quotes required so it doesn't get treated as hex
+    imageurl: http://something
