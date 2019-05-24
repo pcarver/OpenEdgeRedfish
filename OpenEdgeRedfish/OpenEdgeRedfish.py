@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from docopt import docopt
 from multiprocessing import Pool
+import os
 import requests
 import sys
 import yaml
@@ -11,10 +12,15 @@ to verify and modify the versions of pre-boot software components.
 
 Usage:
    %(prog)s [-i] [--config <config.yaml>] --status
+   %(prog)s [-i] [--config <config.yaml>] --OEMstatus
    %(prog)s [-i] [--config <config.yaml>] --checkversions
    %(prog)s [-i] [--config <config.yaml>] forceoff [--target <number>]
    %(prog)s [-i] [--config <config.yaml>] poweron [--target <number>]
+   %(prog)s [-i] [--config <config.yaml>] powerstate [--target <number>]
    %(prog)s [-i] [--config <config.yaml>] getbiosparameters [--target <number>]
+   %(prog)s [-i] [--config <config.yaml>] preserve [--target <number>]
+   %(prog)s [-i] [--config <config.yaml>] updateBMCfirmware [--target <number>]
+   %(prog)s [-i] [--config <config.yaml>] updateBIOSfirmware [--target <number>]
    %(prog)s --example
    %(prog)s --help
 
@@ -32,17 +38,10 @@ Options:
 
 def main():
     args = docopt(usage)
-    # print(args)
-    if args['--config']:
-        config = load_config(args)
-        password = config['credentials'].get('password', None)
-        if password is None:
-            import getpass
-            password = getpass.getpass('Enter the Redfish password: ')
-            config['credentials']['password'] = password
-    else:
-        print(usage)
-        return
+    config = load_config(args)
+    if not config:
+        sys.exit(1)
+
     if args['--insecure']:
         import urllib3
         urllib3.disable_warnings()  # New servers may have self signed certs
@@ -50,32 +49,56 @@ def main():
     else:
         config['verify'] = True
     if args['--status']:
-        getBMCUpdateStatus(config)
+        getStatus(config)
+    if args['--OEMstatus']:
+        getOEMUpdateStatuses(config)
     if args['--checkversions']:
         getVersions(config)
     if args['forceoff']:
         powerForceOff(config)
     elif args['poweron']:
         powerOn(config)
+    elif args['powerstate']:
+        getPowerState(config)
     if args['getbiosparameters']:
         getBIOSParameters(config)
+    if args['preserve']:
+        preserveBMCSettings(config)
+    if args['updateBMCfirmware']:
+        updateBMCfirmware(config)
+    if args['updateBIOSfirmware']:
+        updateBIOSfirmwares(config)
 
 
 def load_config(args):
+    if not os.path.isfile(args['--config']):
+        print(usage)
+        print('Config file %s is missing' % args['--config'])
+        return None
     with open(args['--config']) as f:
-        return yaml.safe_load(f.read())
+        config = yaml.safe_load(f.read())
+        password = config['credentials'].get('password', None)
+        if password is None:
+            import getpass
+            password = getpass.getpass('Enter the Redfish password: ')
+            config['credentials']['password'] = password
+    return config
 
 
-def callRedfish(config, url, postdata=None):
+def callRedfish(config, url, postdata=None, patchdata=None):
     auth = (config['credentials']['user'], config['credentials']['password'])
     headers = {'content-type': 'application/json'}
     if postdata:
         print('POST to %s with data %s' % (url, str(postdata)))
-        resp = requests.post(url, auth=auth, headers=headers, data=postdata,
-                             verify=config['verify'])
+        resp = requests.post(url, auth=auth, headers=headers, json=postdata,
+                             verify=config['verify'], timeout=60)
+    elif patchdata:
+        print('PATCH to %s with data %s' % (url, str(patchdata)))
+        resp = requests.patch(url, auth=auth, headers=headers, json=patchdata,
+                             verify=config['verify'], timeout=60)
     else:
         resp = requests.get(url, auth=auth, headers=headers,
-                            verify=config['verify'])
+                            verify=config['verify'], timeout=60)
     print('HTTP Response Code:', resp.status_code,
           http_status_codes[resp.status_code], end='\t')
     if 200 <= resp.status_code < 300:
@@ -90,34 +113,52 @@ def callRedfish(config, url, postdata=None):
 def getVersions(config):
     p = Pool(len(config['targets']))
     configs = [config for t in config['targets']]
-    p.starmap(getVersionsFromOneTarget, zip(configs, config['targets']))
+    p.starmap(getVersion, zip(configs, config['targets']))
 
 
-def getVersionsFromOneTarget(config, target):
+def getVersion(config, target):
     url = 'https://' + target + '/redfish/v1/UpdateService/FirmwareInventory'
     items = ['BIOS1', 'BMC1', 'BMC2', 'CPLD']
     print('Retrieving %s from %s' % (str(', '.join(items)), target))
     for item in items:
         fullurl = url + '/' + item
         resp = callRedfish(config, fullurl)
+        if not resp:
+            return None
         version = resp.json().get('Version', 'Error! Version not found')
         wantedVersion = config['images'][item]['wantedVersion']
-        isGood = '\tGood' if version == wantedVersion else '\t!! BAD !!'
+        isGood = '\033[1m\033[32m\tGood\033[0m' if version == wantedVersion else '\t\033[1m\033[31m!! BAD !!\033[0m'
         print(target + ' > ' + item + ' version: ' + version + isGood)
 
 
-def powerChange(config, resetType, target=None):
+def getPowerStates(config, target=None):
+    """Get Power state of target server,
+       or all servers in config['targets']"""
+    targets = config['targets'] if target is None else [target]
+    p = Pool(len(targets))
+    configs = [config for t in targets]
+    p.starmap(getPowerState, zip(configs, targets))
+
+
+def getPowerState(config, target):
+    url = 'https://' + target
+    url += '/redfish/v1/Systems/Self'
+    resp = callRedfish(config, url)
+    print(target, resp.json()['PowerState'])
+
+
+def powerChanges(config, resetType, target=None):
     """Change Power state of target server,
        or all servers in config['targets']"""
     targets = config['targets'] if target is None else [target]
-    postdata = '{"ResetType":"%s"}' % resetType
+    postdata = {"ResetType": resetType}
     p = Pool(len(targets))
     configs = [config for t in targets]
     postdatas = [postdata for t in targets]
-    p.starmap(powerChangeOneTarget, zip(configs, postdatas, targets))
+    p.starmap(powerChange, zip(configs, postdatas, targets))
 
 
-def powerChangeOneTarget(config, postdata, target):
+def powerChange(config, postdata, target):
     url = 'https://' + target
     url += '/redfish/v1/Systems/Self/Actions/ComputerSystem.Reset'
     resp = callRedfish(config, url, postdata=postdata)
@@ -125,11 +166,17 @@ def powerChangeOneTarget(config, postdata, target):
 
 
 def powerForceOff(config, target=None):
-    powerChange(config, 'ForceOff', target=target)
+    '''Powers off a specific target (i.e. server) or all servers in config if
+    no target is specified.'''
+
+    powerChanges(config, 'ForceOff', target=target)
 
 
 def powerOn(config, target=None):
-    powerChange(config, 'On', target=target)
+    '''Powers on a specific target (i.e. server) or all servers in config if
+    no target is specified.'''
+
+    powerChanges(config, 'On', target=target)
 
 
 def getBIOSParameters(config):
@@ -140,12 +187,86 @@ def getBIOSParameters(config):
         print(yaml.safe_dump(resp.json()))
 
 
-def getBMCUpdateStatus(config):
+def getStatus(config):
     for target in config['targets']:
         url = 'https://' + target + '/redfish/v1/UpdateService'
-        print('Retrieving BMC update status from %s' % target)
+        print('Retrieving full status from %s' % target)
         resp = callRedfish(config, url)
+        someOutput = {}
+        someOutput['Oem'] = resp.json()['Oem']
+        someOutput['Status'] = resp.json()['Status']
+        print('\n', yaml.safe_dump(someOutput))
+
+
+def getOEMUpdateStatuses(config):
+    p = Pool(len(config['targets']))
+    configs = [config for t in config['targets']]
+    p.starmap(getOEMUpdateStatus, zip(configs, config['targets']))
+
+
+def getOEMUpdateStatus(config, target):
+    url = 'https://' + target + '/redfish/v1/UpdateService'
+    print('Retrieving BMC update status from %s' % target)
+    resp = callRedfish(config, url)
+    print('\n', yaml.safe_dump(resp.json()['Oem']))
+
+
+def preserveBMCSettings(config):
+    for target in config['targets']:
+        url = 'https://' + target + '/redfish/v1/UpdateService'
+        # Hardcoded parameters provided by documentation
+        patchdata = {"Oem":
+                     {"BMC":
+                      {"PreserveConfiguration":
+                       {"Authentication": True,
+                        "IPMI": True,
+                        "KVM": True,
+                        "Network": True,
+                        "SEL": True,
+                        "SNMP": True,
+                        "SSH": True
+                       }
+                      }
+                     }
+                    }
+        print('Preserving BMC settings on %s' % target)
+        resp = callRedfish(config, url, patchdata=patchdata)
         print(yaml.safe_dump(resp.json()))
+
+
+def updateBMCfirmware(config):
+    for target in config['targets']:
+        url = 'https://' + target + \
+              '/redfish/v1/UpdateService/Actions/Oem/UpdateService.BMCFwUpdate'
+        firmwareImage = config['images']['BMC1']['imageurl']
+        postdata = {"RemoteImagePath":
+                       firmwareImage,
+                       "FlashType":"FULLFwUpdate"
+                   }
+        print('Updating BMC firmware on %s' % target)
+        resp = callRedfish(config, url, postdata=postdata)
+        if resp.status_code != 204:
+            print('Response %s while updating BMC firmware on %s' % (resp, target))
+
+
+def updateBIOSfirmwares(config):
+    p = Pool(len(config['targets']))
+    configs = [config for t in config['targets']]
+    p.starmap(updateBIOSfirmware, zip(configs, config['targets']))
+
+
+def updateBIOSfirmware(config, target):
+    url = 'https://' + target + \
+          '/redfish/v1/UpdateService/Actions/Oem/UpdateService.BIOSFwUpdate'
+    firmwareImage = config['images']['BIOS1']['imageurl']
+    postdata = {"RemoteImagePath":
+                   firmwareImage,
+                   "PreserveBIOSNVRAMRegion":True
+               }
+    print('Updating BIOS firmware on %s' % target)
+    resp = callRedfish(config, url, postdata=postdata)
+    if resp.status_code != 204:
+        print('Response %s while updating BIOS firmware on %s' % (resp, target))
 
 
 http_status_codes = {
@@ -219,18 +340,6 @@ if __name__ == '__main__':
     main()
 
 '''
-# preserve BMC settings
-curl -k -u Administrator:superuser -H content-type:application/json -X PATCH -d '{"Oem":{"BMC":{"PreserveConfiguration":{"Authentication": true, "IPMI": true, "KVM": true, "Network": true, "SEL": true, "SNMP": true, "SSH": true}}}}' https://172.26.16.${i}/redfish/v1/UpdateService
-
-#update BMC
-curl -k -u Administrator:superuser -H content-type:application/json -X POST -d '{"RemoteImagePath":"http://204.127.189.10:8090/S9N31300.ima_enc","FlashType":"FULLFwUpdate"}' https://172.26.16.${i}/redfish/v1/UpdateService/Actions/Oem/UpdateService.BMCFwUpdate
-
-#update BIOS
-
-curl -s -m 3 -d '{ "RemoteImagePath":"http://204.127.189.10:8090/S9N_3B06.BIN_enc", "PreserveBIOSNVRAMRegion":true }' -H "Content-Type: application/json" -X POST -k -u Administrator:superuser https://172.26.16.${i}/redfish/v1/UpdateService/Actions/Oem/UpdateService.BIOSFwUpdate
-
-
 # update BIOS configuration
-curl -k -u Administrator:superuser -X PATCH -H 'Content-Type: application/json' -d '{"Attributes":{"PMS002":"Disable","CSM007":"Do not launch","FBO001":"LEGACY","FBO101":"Hard Disk","FBO102":"USB","FBO103":"Disabled","FBO104":"Disabled","IIOS1FE":"Enable"}}' https://172.26.16.${i}/redfish/v1/Systems/Self/Bios/SD
-
+curl -k -u userid:password -X PATCH -H 'Content-Type: application/json' -d '{"Attributes":{"PMS002":"Disable","CSM007":"Do not launch","FBO001":"LEGACY","FBO101":"Hard Disk","FBO102":"USB","FBO103":"Disabled","FBO104":"Disabled","IIOS1FE":"Enable"}}' https://172.26.16.${i}/redfish/v1/Systems/Self/Bios/SD
 '''
